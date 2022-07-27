@@ -1,5 +1,6 @@
+from contextlib import ExitStack
 from os.path import exists
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import PySimpleGUI as sg
 import PIL
@@ -15,8 +16,38 @@ from PIL import Image, ImageOps
 #   Do the thing.
 
 
-def combine(metallic_img: Image, smoothness_img: Image,
-            is_rough: bool) -> Image:
+class Images(object):
+    metallic_img: Optional[Image.Image]
+    smoothness_img: Optional[Image.Image]
+
+    def __init__(self, metallic_file: str, smoothness_file: str):
+        self.metallic_file = metallic_file
+        self.smoothness_file = smoothness_file
+        self.metallic_img = None
+        self.smoothness_img = None
+
+    def open(self):
+        self.stack = ExitStack()
+        if self.metallic_file:
+            self.metallic_img = self.stack.enter_context(
+                Image.open(self.metallic_file))
+        if self.smoothness_file:
+            self.smoothness_img = self.stack.enter_context(
+                Image.open(self.smoothness_file))
+
+    def close(self):
+        self.stack.close()
+
+    def __enter__(self):
+        self.open()
+        return (self.metallic_img, self.smoothness_img)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+def combine(metallic_img: Image.Image, smoothness_img: Image.Image,
+            is_rough: bool) -> Image.Image:
     """Combines metallic and smoothness textures into combined texture.
 
     If is_rough is set, then the smoothness texture is actually a
@@ -39,6 +70,7 @@ USE_SOLID: int = 1
 
 def process(values: Dict[str, Any]) -> bool:
     metallic = values["metallic"].strip()
+    is_nonmetallic = values["non-metallic"]
     smoothness = values["smoothness"].strip()
     is_rough = not values["smooth"]
     save_file = values["saveas"].strip()
@@ -48,43 +80,40 @@ def process(values: Dict[str, Any]) -> bool:
         sg.popup("You need to specify a save file!", title="Oops")
         return False
     # print(f"Metallic: {metallic}, roughness: {roughness}, rough: {is_rough}")
-    if metallic == "":
-        sg.popup("You need to specify a metallic file!", title="Oops")
+    if metallic == "" and not is_nonmetallic:
+        sg.popup("You need to specify a metallic file (or check Non-metallic)!",
+                 title="Oops")
         return False
     if mode == USE_COLOR and smoothness == "":
         sg.popup("You need to specify a roughness/smoothness file!",
                  title="Oops")
         return False
+    if mode == USE_SOLID and is_nonmetallic:
+        sg.popup(
+            "You need to specify at least a metallic file or a "
+            "roughness/smoothness file!",
+            title="Oops")
+        return False
+    if is_nonmetallic:
+        metallic = ""
+    if mode == USE_SOLID:
+        smoothness = ""
 
-    image: Image
+    image: Image.Image
 
     try:
-        with Image.open(metallic) as metallic_img:
-            if mode == USE_COLOR:
-                try:
-                    with Image.open(smoothness) as smoothness_img:
-                        if metallic_img.size != smoothness_img.size:
-                            sg.popup("Images are not the same size",
-                                     title="Oops")
-                            return False
-                        image = combine(metallic_img, smoothness_img, is_rough)
-                except FileNotFoundError:
-                    sg.popup(f"Failed to find file {smoothness}", title="Oops")
-                    return False
-                except PIL.UnidentifiedImageError:
-                    sg.popup(f"Failed to identify {smoothness} as an image",
-                             title="Oops")
-                    return False
-            else:
-                solid = Image.new("L", metallic_img.size)
-                solid = ImageOps.invert(solid)  # All one
-                image = combine(metallic_img, solid, is_rough)
-
-    except FileNotFoundError:
-        sg.popup(f"Failed to find file {metallic}", title="Oops")
+        with Images(metallic, smoothness) as (metallic_img, smoothness_img):
+            if metallic_img is None:
+                metallic_img = Image.new("L", smoothness_img.size)
+            if smoothness_img is None:
+                smoothness_img = Image.new("L", metallic_img.size)
+                smoothness_img = ImageOps.invert(smoothness_img)  # All one
+            image = combine(metallic_img, smoothness_img, is_rough)
+    except FileNotFoundError as e:
+        sg.popup(f"File not found: {e.filename}", title="File not found")
         return False
-    except PIL.UnidentifiedImageError:
-        sg.popup(f"Failed to identify {metallic} as an image", title="Oops")
+    except PIL.UnidentifiedImageError as e:
+        sg.popup(f"Not an image: {e.filename}", title="Not an image")
         return False
 
     if exists(save_file):
@@ -101,7 +130,11 @@ def process(values: Dict[str, Any]) -> bool:
 
 def main() -> None:
     layout = [[sg.Text("Metallic map file:")],
-              [sg.In(key="metallic"), sg.FileBrowse()],
+              [
+                  sg.In(key="metallic"),
+                  sg.FileBrowse(),
+                  sg.Checkbox("Non-metallic", key="non-metallic"),
+              ], 
               [sg.Text("Roughness/smoothness map file:")],
               [
                   sg.In(key="smoothness"),
@@ -112,7 +145,8 @@ def main() -> None:
               [
                   sg.In(default_text="output.png", key="saveas"),
                   sg.FileSaveAs(default_extension=".png")
-              ], [sg.Submit("Go!", key="submit"),
+              ], 
+              [sg.Submit("Go!", key="submit"),
                   sg.Cancel(key="cancel")]]
 
     window = sg.Window("Neos combiner thing", layout)
